@@ -41,28 +41,41 @@ inference works immediately, no training required first:
 
 ### Inference
 
-Both inference scripts expect an input CSV with a `sequence` column and a `pred_label`
-column (Stage-1 output; rows with `pred_label != 1` are skipped):
+**Input file**: a CSV with at minimum a `sequence` column and a `pred_label` column
+(the upstream Stage-1 AMP-plausible-vs-decoy screen's output; rows where
+`pred_label != 1` are skipped — i.e. only Stage-1 survivors get scored). Any other
+columns (e.g. `DRAMP_ID`, `Name`) are optional, passed through unchanged, and used
+only to make the printed top-5 report more readable.
+
+```csv
+DRAMP_ID,Name,sequence,pred_label
+PEP001,Example AMP,GIGKFLHSAKKFGKAFVGEIMNS,1
+PEP002,Filtered decoy,ACDEFGHIKLMNPQRSTVWY,0
+```
+
+**Non-standard residues** (e.g. hydrocarbon-staple anchor codes like `X`/`Z`/`S5`/`R8`)
+aren't in ESM2's vocabulary — substitute them with a natural stand-in (commonly
+Leucine, to preserve bulky hydrophobic character) in the `sequence` column before
+scoring.
 
 ```bash
 python svm/infer_stapled_esm2svm.py --input your_stage1_output.csv --output predictions_svm.csv
 python hdc/infer_stapled_esm2hdc.py --input your_stage1_output.csv --output predictions_hdc.csv
 ```
 
-`svm/infer_stapled_esm2svm.py` appends: `esm2svm_p_amp_pore`, `esm2svm_p_cpp_pore`,
-`esm2svm_pred_label`, `esm2svm_pred_class`, `esm2svm_svm_distance` (signed distance from
-the SVM decision boundary; negative = AMP_pore side, positive = CPP_pore side).
+Both default to `--input symbolic_onlinehd_best_bundle/predictions/stapled_predictions.csv`
+if `--input` is omitted (a path from the original monorepo this was extracted from —
+you'll almost always want to pass `--input` explicitly).
 
-`hdc/infer_stapled_esm2hdc.py` appends: `esm2hdc_p_amp_pore`, `esm2hdc_p_cpp_pore`,
-`esm2hdc_pred_label`, `esm2hdc_pred_class`, then calls `hdc/hdc_scoring.py` internally to
-also append `esm2hdc_cos_amp`, `esm2hdc_cos_cpp`, `esm2hdc_axis_score` (combined
-AMP&harr;CPP axis score in the OnlineHD hypervector space; same sign convention as the
-SVM distance).
+### Artifacts produced
 
-**Non-standard residues** (e.g. hydrocarbon-staple anchor codes like `X`/`Z`/`S5`/`R8`)
-aren't in ESM2's vocabulary — substitute them with a natural stand-in (commonly
-Leucine, to preserve bulky hydrophobic character) in the `sequence` column before
-scoring.
+| Script | File | Contents |
+|---|---|---|
+| `svm/infer_stapled_esm2svm.py` | `--output` CSV (default `svm/predictions/stapled_predictions_esm2svm.csv`) | input CSV's rows (Stage-1 survivors only) + `esm2svm_p_amp_pore`, `esm2svm_p_cpp_pore`, `esm2svm_pred_label`, `esm2svm_pred_class`, `esm2svm_svm_distance` (signed distance from the SVM decision boundary; negative = AMP_pore side, positive = CPP_pore side) |
+| | `embeddings/stapled_esm2svm_<input basename>_embeddings.npz` (or `--emb-output`) | raw ESM2 embeddings (`X`), `sequences`, `pred_class`, `p_amp_pore`, `p_cpp_pore`, `dramp_id` — for downstream use (e.g. t-SNE plots) |
+| `hdc/infer_stapled_esm2hdc.py` | `--output` CSV (default `hdc/predictions/stapled_predictions_esm2hdc.csv`) | input CSV's rows (Stage-1 survivors only) + `esm2hdc_p_amp_pore`, `esm2hdc_p_cpp_pore`, `esm2hdc_pred_label`, `esm2hdc_pred_class`, and (via `hdc_scoring.py`, called automatically) `esm2hdc_cos_amp`, `esm2hdc_cos_cpp`, `esm2hdc_axis_score` (combined AMP&harr;CPP axis score in the OnlineHD hypervector space; same sign convention as the SVM distance) |
+| | `embeddings/stapled_esm2_<input basename>_embeddings.npz` (or `--emb-output`) | raw ESM2 embeddings (`X`), `sequences`, `pred_class`, `dramp_id` |
+| `hdc/hdc_scoring.py` (standalone) | overwrites its `--input` CSV (or writes `--output` if given) | appends just `esm2hdc_cos_amp`, `esm2hdc_cos_cpp`, `esm2hdc_axis_score` to a CSV that already has `esm2hdc_*` predictions — used if you ran `infer_stapled_esm2hdc.py` from an older version or want to recompute the axis score alone |
 
 ### (Re)training
 
@@ -75,7 +88,18 @@ python hdc/train_esm2_hdc_amp_cpp.py
 ```
 
 Both re-run 5-fold CV at the pinned config first (expect mean accuracy ~0.95, MCC
-~0.90) before the final full-data fit that overwrites the checkpoint.
+~0.90) before the final full-data fit that overwrites the checkpoint. Neither takes an
+input file — training data comes from `embeddings/esm2_t12_35M_UR50D_poreforming_amp_cpp.npz`
+(see "What's included" above).
+
+| Script | File | Contents |
+|---|---|---|
+| `svm/train_esm2_svm_amp_cpp.py` | `embeddings/esm2_t12_35M_UR50D_poreforming_amp_cpp.npz` | cached ESM2 embeddings (`X`) + labels (`y`) for the 634-sequence training set (written once; reused by every script above) |
+| | `svm/checkpoints/esm2_svm_amp_cpp_rbf_C1.0_seed42.pkl` | fitted `{'svm': ..., 'scaler': ...}` — overwrites the shipped checkpoint |
+| | `svm/reports/esm2_svm_amp_cpp_<timestamp>.txt` | 5-fold CV classification report, MCC, confusion matrix |
+| `hdc/train_esm2_hdc_amp_cpp.py` | same `embeddings/*.npz` as above | shared with the SVM trainer |
+| | `hdc/checkpoints/esm2_hdc_amp_vs_cpp_d{dim}_lr{lr}_ep{epochs}_seed{seed}.pt` | fitted OnlineHD model — overwrites the shipped checkpoint if hyperparameters match, otherwise adds a new file |
+| | `hdc/reports/esm2_hdc_amp_vs_cpp_<timestamp>.txt` | 5-fold CV classification report, MCC, confusion matrix |
 
 ### Other scripts in `hdc/`
 
